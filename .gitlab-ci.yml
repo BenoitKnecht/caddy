@@ -1,0 +1,44 @@
+stages:
+  - test
+  - build
+
+variables:
+  PKG: github.com/mholt/caddy
+
+before_script:
+  - mkdir -p /go/src/github.com/mholt
+  - ln -s $CI_PROJECT_DIR /go/src/$PKG
+  - cd /go/src/$PKG
+
+test:
+  stage: test
+  tags:
+    - docker
+  image: golang:1.8
+  script:
+    - go get -t $(go list ./... | grep -v ^$PKG/vendor)
+    - go get github.com/golang/lint/golint
+    - go get github.com/alecthomas/gometalinter
+    - go get github.com/client9/misspell/cmd/misspell
+    - go get github.com/gordonklaus/ineffassign
+    - go get golang.org/x/tools/cmd/goimports
+    - go get github.com/tsenart/deadcode
+    - gometalinter --disable-all -E vet -E gofmt -E misspell -E ineffassign -E goimports -E deadcode --tests --vendor ./...
+    - go test -race $(go list ./... | grep -v ^$PKG/vendor)
+
+build:
+  stage: build
+  tags:
+    - docker
+  image: golang:1.8
+  variables:
+    CGO_ENABLED: 0
+  script:
+    - cd caddy
+    - go get ./...
+    - ./build.bash
+    - mkdir ../$CI_PROJECT_NAME-${CI_COMMIT_TAG:-$CI_COMMIT_REF_NAME}
+    - mv caddy ../$CI_PROJECT_NAME-${CI_COMMIT_TAG:-$CI_COMMIT_REF_NAME}
+  artifacts:
+    untracked: true
+    name: $CI_PROJECT_NAME-${CI_COMMIT_TAG:-$CI_COMMIT_REF_NAME}
