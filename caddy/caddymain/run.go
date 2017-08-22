@@ -21,6 +21,9 @@ import (
 
 	"github.com/mholt/caddy/caddytls"
 	// This is where other plugins get plugged in (imported)
+	_ "github.com/captncraig/caddy-realip"
+	_ "github.com/miekg/caddy-prometheus"
+	_ "github.com/pyed/ipfilter"
 )
 
 func init() {
