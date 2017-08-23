@@ -9,6 +9,8 @@ RUN CGO_ENABLED=0 ./build.bash
 
 FROM alpine:3.6
 
+RUN apk --update add ca-certificates && rm -rf /var/cache/apk/*
+
 COPY --from=build /go/src/github.com/mholt/caddy/caddy/caddy /usr/local/bin/
 
 ENTRYPOINT ["caddy"]
