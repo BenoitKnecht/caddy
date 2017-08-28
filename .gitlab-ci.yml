@@ -16,7 +16,7 @@ test:
     - docker
   image: golang:1.9
   script:
-    - go get -t $(go list ./... | grep -v ^$PKG/vendor)
+    - go get -t ./...
     - go get github.com/golang/lint/golint
     - go get github.com/alecthomas/gometalinter
     - go get github.com/client9/misspell/cmd/misspell
@@ -24,7 +24,7 @@ test:
     - go get golang.org/x/tools/cmd/goimports
     - go get github.com/tsenart/deadcode
     - gometalinter --disable-all -E vet -E gofmt -E misspell -E ineffassign -E goimports -E deadcode --tests --vendor ./...
-    - go test -race $(go list ./... | grep -v ^$PKG/vendor)
+    - go test -race ./...
 
 build:
   stage: build
