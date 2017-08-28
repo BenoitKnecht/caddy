@@ -5,8 +5,7 @@ COPY . /go/src/github.com/mholt/caddy/
 WORKDIR /go/src/github.com/mholt/caddy/caddy
 
 RUN go get ./...
-RUN go get github.com/caddyserver/buildworker
-RUN go run build.go
+RUN CGO_ENABLED=0 go build
 
 FROM alpine:3.6
 
