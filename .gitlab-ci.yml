@@ -35,7 +35,7 @@ build:
   script:
     - cd caddy
     - go get ./...
-    - go get github.com/caddyserver/buildworker
+    - go get github.com/caddyserver/builds
     - go run build.go
     - mkdir ../$CI_PROJECT_NAME-${CI_COMMIT_TAG:-$CI_COMMIT_REF_NAME}
     - mv caddy ../$CI_PROJECT_NAME-${CI_COMMIT_TAG:-$CI_COMMIT_REF_NAME}
