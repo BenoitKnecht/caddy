@@ -16,6 +16,7 @@ test:
     - docker
   image: golang:1.9
   script:
+    - echo 127.0.0.1 quic.clemente.io >> /etc/hosts
     - go get -t ./...
     - go get github.com/golang/lint/golint
     - go get github.com/alecthomas/gometalinter
