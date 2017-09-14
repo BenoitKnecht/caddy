@@ -3,6 +3,7 @@ package browse
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
@@ -226,7 +227,7 @@ func TestBrowseTemplate(t *testing.T) {
 func TestBrowseJson(t *testing.T) {
 	b := Browse{
 		Next: httpserver.HandlerFunc(func(w http.ResponseWriter, r *http.Request) (int, error) {
-			t.Fatalf("Next shouldn't be called")
+			t.Fatalf("Next shouldn't be called: %s", r.URL)
 			return 0, nil
 		}),
 		Configs: []Config{
@@ -461,7 +462,10 @@ func TestBrowseRedirect(t *testing.T) {
 
 func TestDirSymlink(t *testing.T) {
 	if runtime.GOOS == "windows" {
-		return // TODO: Temporarily skipping these tests on Windows, so we can get a release out that fixes the build server
+		// Windows support for symlinks is limited, and we had a hard time getting
+		// all these tests to pass with the permissions of CI; so just skip them
+		fmt.Println("Skipping browse symlink tests on Windows...")
+		return
 	}
 
 	testCases := []struct {
