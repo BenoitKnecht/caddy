@@ -1,3 +1,17 @@
+// Copyright 2015 Light Code Labs, LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package fastcgi
 
 import (
@@ -70,11 +84,15 @@ func TestRuleParseAddress(t *testing.T) {
 	}
 
 	for _, entry := range getClientTestTable {
-		if actualnetwork, _ := parseAddress(entry.rule.Address()); actualnetwork != entry.expectednetwork {
-			t.Errorf("Unexpected network for address string %v. Got %v, expected %v", entry.rule.Address(), actualnetwork, entry.expectednetwork)
+		addr, err := entry.rule.Address()
+		if err != nil {
+			t.Errorf("Unexpected error in retrieving address: %s", err.Error())
 		}
-		if _, actualaddress := parseAddress(entry.rule.Address()); actualaddress != entry.expectedaddress {
-			t.Errorf("Unexpected parsed address for address string %v. Got %v, expected %v", entry.rule.Address(), actualaddress, entry.expectedaddress)
+		if actualnetwork, _ := parseAddress(addr); actualnetwork != entry.expectednetwork {
+			t.Errorf("Unexpected network for address string %v. Got %v, expected %v", addr, actualnetwork, entry.expectednetwork)
+		}
+		if _, actualaddress := parseAddress(addr); actualaddress != entry.expectedaddress {
+			t.Errorf("Unexpected parsed address for address string %v. Got %v, expected %v", addr, actualaddress, entry.expectedaddress)
 		}
 	}
 }
@@ -351,7 +369,10 @@ func TestBalancer(t *testing.T) {
 	for i, test := range tests {
 		b := address(test...)
 		for _, host := range test {
-			a := b.Address()
+			a, err := b.Address()
+			if err != nil {
+				t.Errorf("Unexpected error in trying to retrieve address: %s", err.Error())
+			}
 			if a != host {
 				t.Errorf("Test %d: expected %s, found %s", i, host, a)
 			}
