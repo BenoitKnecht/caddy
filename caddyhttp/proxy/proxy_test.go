@@ -1,3 +1,17 @@
+// Copyright 2015 Light Code Labs, LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package proxy
 
 import (
@@ -302,6 +316,40 @@ func TestWebSocketReverseProxyNonHijackerPanic(t *testing.T) {
 
 	nonHijacker := httptest.NewRecorder()
 	p.ServeHTTP(nonHijacker, r)
+}
+
+func TestWebSocketReverseProxyBackendShutDown(t *testing.T) {
+	shutdown := make(chan struct{})
+	backend := httptest.NewServer(websocket.Handler(func(ws *websocket.Conn) {
+		shutdown <- struct{}{}
+	}))
+	defer backend.Close()
+
+	go func() {
+		<-shutdown
+		backend.Close()
+	}()
+
+	// Get proxy to use for the test
+	p := newWebSocketTestProxy(backend.URL, false)
+	backendProxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p.ServeHTTP(w, r)
+	}))
+	defer backendProxy.Close()
+
+	// Set up WebSocket client
+	url := strings.Replace(backendProxy.URL, "http://", "ws://", 1)
+	ws, err := websocket.Dial(url, "", backendProxy.URL)
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ws.Close()
+
+	var actualMsg string
+	if rcvErr := websocket.Message.Receive(ws, &actualMsg); rcvErr == nil {
+		t.Errorf("we don't get backend shutdown notification")
+	}
 }
 
 func TestWebSocketReverseProxyServeHTTPHandler(t *testing.T) {
@@ -1482,7 +1530,7 @@ func TestQuic(t *testing.T) {
 	}
 
 	upstream := "quic.clemente.io:8086"
-	config := "proxy / quic://" + upstream
+	config := "proxy / quic://" + upstream + " {\n\tinsecure_skip_verify\n}"
 	content := "Hello, client"
 
 	// make proxy
@@ -1508,7 +1556,7 @@ func TestQuic(t *testing.T) {
 		})
 		err = h2quic.ListenAndServeQUIC(
 			upstream,
-			path.Join(dir, "testdata", "fullchain.pem"),
+			path.Join(dir, "testdata", "fullchain.pem"), // TODO: Use a dynamically-generated, self-signed cert instead
 			path.Join(dir, "testdata", "privkey.pem"),
 			handler,
 		)
