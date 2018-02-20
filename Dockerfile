@@ -7,7 +7,7 @@ WORKDIR /go/src/github.com/mholt/caddy/caddy
 RUN go get ./...
 RUN CGO_ENABLED=0 go build
 
-FROM alpine:3.6
+FROM alpine:3.7
 
 RUN apk --update add ca-certificates && rm -rf /var/cache/apk/*
 
