@@ -19,6 +19,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -57,15 +59,15 @@ func (cg configGroup) getConfig(name string) *Config {
 		}
 	}
 
-	// as a fallback, try a config that serves all names
+	// try a config that serves all names (this
+	// is basically the same as a config defined
+	// for "*" -- I think -- but the above loop
+	// doesn't try an empty string)
 	if config, ok := cg[""]; ok {
 		return config
 	}
 
-	// as a last resort, use a random config
-	// (even if the config isn't for that hostname,
-	// it should help us serve clients without SNI
-	// or at least defer TLS alerts to the cert)
+	// no matches, so just serve up a random config
 	for _, config := range cg {
 		return config
 	}
@@ -100,6 +102,86 @@ func (cfg *Config) GetCertificate(clientHello *tls.ClientHelloInfo) (*tls.Certif
 	return &cert.Certificate, err
 }
 
+// getCertificate gets a certificate that matches name (a server name)
+// from the in-memory cache, according to the lookup table associated with
+// cfg. The lookup then points to a certificate in the Instance certificate
+// cache.
+//
+// If there is no exact match for name, it will be checked against names of
+// the form '*.example.com' (wildcard certificates) according to RFC 6125.
+// If a match is found, matched will be true. If no matches are found, matched
+// will be false and a "default" certificate will be returned with defaulted
+// set to true. If defaulted is false, then no certificates were available.
+//
+// The logic in this function is adapted from the Go standard library,
+// which is by the Go Authors.
+//
+// This function is safe for concurrent use.
+func (cfg *Config) getCertificate(name string) (cert Certificate, matched, defaulted bool) {
+	var certKey string
+	var ok bool
+
+	// Not going to trim trailing dots here since RFC 3546 says,
+	// "The hostname is represented ... without a trailing dot."
+	// Just normalize to lowercase.
+	name = strings.ToLower(name)
+
+	cfg.certCache.RLock()
+	defer cfg.certCache.RUnlock()
+
+	// exact match? great, let's use it
+	if certKey, ok = cfg.Certificates[name]; ok {
+		cert = cfg.certCache.cache[certKey]
+		matched = true
+		return
+	}
+
+	// try replacing labels in the name with wildcards until we get a match
+	labels := strings.Split(name, ".")
+	for i := range labels {
+		labels[i] = "*"
+		candidate := strings.Join(labels, ".")
+		if certKey, ok = cfg.Certificates[candidate]; ok {
+			cert = cfg.certCache.cache[certKey]
+			matched = true
+			return
+		}
+	}
+
+	// check the certCache directly to see if the SNI name is
+	// already the key of the certificate it wants! this is vital
+	// for supporting the TLS-SNI challenge, since the tlsSNISolver
+	// just puts the temporary certificate in the instance cache,
+	// with no regard for configs; this also means that the SNI
+	// can contain the hash of a specific cert (chain) it wants
+	// and we will still be able to serve it up
+	// (this behavior, by the way, could be controversial as to
+	// whether it complies with RFC 6066 about SNI, but I think
+	// it does soooo...)
+	// NOTE/TODO: TLS-SNI challenge is changing, as of Jan. 2018
+	// but what will be different, if it ever returns, is unclear
+	if directCert, ok := cfg.certCache.cache[name]; ok {
+		cert = directCert
+		matched = true
+		return
+	}
+
+	// if nothing matches and SNI was not provided, use a random
+	// certificate; at least there's a chance this older client
+	// can connect, and in the future we won't need this provision
+	// (if SNI is present, it's probably best to just raise a TLS
+	// alert by not serving a certificate)
+	if name == "" {
+		for _, certKey := range cfg.Certificates {
+			defaulted = true
+			cert = cfg.certCache.cache[certKey]
+			return
+		}
+	}
+
+	return
+}
+
 // getCertDuringHandshake will get a certificate for name. It first tries
 // the in-memory cache. If no certificate for name is in the cache, the
 // config most closely corresponding to name will be loaded. If that config
@@ -113,7 +195,7 @@ func (cfg *Config) GetCertificate(clientHello *tls.ClientHelloInfo) (*tls.Certif
 // This function is safe for concurrent use.
 func (cfg *Config) getCertDuringHandshake(name string, loadIfNecessary, obtainIfNecessary bool) (Certificate, error) {
 	// First check our in-memory cache to see if we've already loaded it
-	cert, matched, defaulted := getCertificate(name)
+	cert, matched, defaulted := cfg.getCertificate(name)
 	if matched {
 		return cert, nil
 	}
@@ -135,8 +217,8 @@ func (cfg *Config) getCertDuringHandshake(name string, loadIfNecessary, obtainIf
 
 			name = strings.ToLower(name)
 
-			// Make sure aren't over any applicable limits
-			err := cfg.checkLimitsForObtainingNewCerts(name)
+			// Make sure the certificate should be obtained based on config
+			err := cfg.checkIfCertShouldBeObtained(name)
 			if err != nil {
 				return Certificate{}, err
 			}
@@ -159,10 +241,52 @@ func (cfg *Config) getCertDuringHandshake(name string, loadIfNecessary, obtainIf
 	return Certificate{}, fmt.Errorf("no certificate available for %s", name)
 }
 
+// checkIfCertShouldBeObtained checks to see if an on-demand tls certificate
+// should be obtained for a given domain based upon the config settings.  If
+// a non-nil error is returned, do not issue a new certificate for name.
+func (cfg *Config) checkIfCertShouldBeObtained(name string) error {
+	// If the "ask" URL is defined in the config, use to determine if a
+	// cert should obtained
+	if cfg.OnDemandState.AskURL != nil {
+		return cfg.checkURLForObtainingNewCerts(name)
+	}
+
+	// Otherwise use the limit defined by the "max_certs" setting
+	return cfg.checkLimitsForObtainingNewCerts(name)
+}
+
+func (cfg *Config) checkURLForObtainingNewCerts(name string) error {
+	client := http.Client{
+		Timeout: 10 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return errors.New("following http redirects is not allowed")
+		},
+	}
+
+	// Copy the URL from the config in order to modify it for this request
+	askURL := new(url.URL)
+	*askURL = *cfg.OnDemandState.AskURL
+
+	query := askURL.Query()
+	query.Set("domain", name)
+	askURL.RawQuery = query.Encode()
+
+	resp, err := client.Get(askURL.String())
+	if err != nil {
+		return fmt.Errorf("error checking %v to deterine if certificate for hostname '%s' should be allowed: %v", cfg.OnDemandState.AskURL, name, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return fmt.Errorf("certificate for hostname '%s' not allowed, non-2xx status code %d returned from %v", name, resp.StatusCode, cfg.OnDemandState.AskURL)
+	}
+
+	return nil
+}
+
 // checkLimitsForObtainingNewCerts checks to see if name can be issued right
-// now according to mitigating factors we keep track of and preferences the
-// user has set. If a non-nil error is returned, do not issue a new certificate
-// for name.
+// now according the maximum count defined in the configuration. If a non-nil
+// error is returned, do not issue a new certificate for name.
 func (cfg *Config) checkLimitsForObtainingNewCerts(name string) error {
 	// User can set hard limit for number of certs for the process to issue
 	if cfg.OnDemandState.MaxObtain > 0 &&
@@ -214,7 +338,7 @@ func (cfg *Config) obtainOnDemandCertificate(name string) (Certificate, error) {
 	obtainCertWaitChans[name] = wait
 	obtainCertWaitChansMu.Unlock()
 
-	// do the obtain
+	// obtain the certificate
 	log.Printf("[INFO] Obtaining new certificate for %s", name)
 	err := cfg.ObtainCert(name, false)
 
@@ -273,9 +397,9 @@ func (cfg *Config) handshakeMaintenance(name string, cert Certificate) (Certific
 				// quite common considering not all certs have issuer URLs that support it.
 				log.Printf("[ERROR] Getting OCSP for %s: %v", name, err)
 			}
-			certCacheMu.Lock()
-			certCache[name] = cert
-			certCacheMu.Unlock()
+			cfg.certCache.Lock()
+			cfg.certCache.cache[cert.Hash] = cert
+			cfg.certCache.Unlock()
 		}
 	}
 
@@ -304,29 +428,22 @@ func (cfg *Config) renewDynamicCertificate(name string, currentCert Certificate)
 	obtainCertWaitChans[name] = wait
 	obtainCertWaitChansMu.Unlock()
 
-	// do the renew and reload the certificate
+	// renew and reload the certificate
 	log.Printf("[INFO] Renewing certificate for %s", name)
 	err := cfg.RenewCert(name, false)
 	if err == nil {
-		// immediately flush this certificate from the cache so
-		// the name doesn't overlap when we try to replace it,
-		// which would fail, because overlapping existing cert
-		// names isn't allowed
-		certCacheMu.Lock()
-		for _, certName := range currentCert.Names {
-			delete(certCache, certName)
-		}
-		certCacheMu.Unlock()
-
 		// even though the recursive nature of the dynamic cert loading
 		// would just call this function anyway, we do it here to
-		// make the replacement as atomic as possible. (TODO: similar
-		// to the note in maintain.go, it'd be nice if the clearing of
-		// the cache entries above and this load function were truly
-		// atomic...)
-		_, err := currentCert.Config.CacheManagedCertificate(name)
+		// make the replacement as atomic as possible.
+		newCert, err := currentCert.configs[0].CacheManagedCertificate(name)
 		if err != nil {
-			log.Printf("[ERROR] loading renewed certificate: %v", err)
+			log.Printf("[ERROR] loading renewed certificate for %s: %v", name, err)
+		} else {
+			// replace the old certificate with the new one
+			err = cfg.certCache.replaceCertificate(currentCert, newCert)
+			if err != nil {
+				log.Printf("[ERROR] Replacing certificate for %s: %v", name, err)
+			}
 		}
 	}
 

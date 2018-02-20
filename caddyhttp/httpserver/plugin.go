@@ -27,6 +27,7 @@ import (
 
 	"github.com/mholt/caddy"
 	"github.com/mholt/caddy/caddyfile"
+	"github.com/mholt/caddy/caddyhttp/staticfiles"
 	"github.com/mholt/caddy/caddytls"
 )
 
@@ -90,11 +91,13 @@ func hideCaddyfile(cctx caddy.Context) error {
 	return nil
 }
 
-func newContext() caddy.Context {
-	return &httpContext{keysToSiteConfigs: make(map[string]*SiteConfig)}
+func newContext(inst *caddy.Instance) caddy.Context {
+	return &httpContext{instance: inst, keysToSiteConfigs: make(map[string]*SiteConfig)}
 }
 
 type httpContext struct {
+	instance *caddy.Instance
+
 	// keysToSiteConfigs maps an address at the top of a
 	// server block (a "key") to its SiteConfig. Not all
 	// SiteConfigs will be represented here, only ones
@@ -114,12 +117,14 @@ func (h *httpContext) saveConfig(key string, cfg *SiteConfig) {
 // executing directives and otherwise prepares the directives to
 // be parsed and executed.
 func (h *httpContext) InspectServerBlocks(sourceFile string, serverBlocks []caddyfile.ServerBlock) ([]caddyfile.ServerBlock, error) {
+	siteAddrs := make(map[string]string)
+
 	// For each address in each server block, make a new config
 	for _, sb := range serverBlocks {
 		for _, key := range sb.Keys {
 			key = strings.ToLower(key)
 			if _, dup := h.keysToSiteConfigs[key]; dup {
-				return serverBlocks, fmt.Errorf("duplicate site address: %s", key)
+				return serverBlocks, fmt.Errorf("duplicate site key: %s", key)
 			}
 			addr, err := standardizeAddress(key)
 			if err != nil {
@@ -135,6 +140,23 @@ func (h *httpContext) InspectServerBlocks(sourceFile string, serverBlocks []cadd
 				addr.Port = Port
 			}
 
+			// Make sure the adjusted site address is distinct
+			addrCopy := addr // make copy so we don't disturb the original, carefully-parsed address struct
+			if addrCopy.Port == "" && Port == DefaultPort {
+				addrCopy.Port = Port
+			}
+			addrStr := strings.ToLower(addrCopy.String())
+			if otherSiteKey, dup := siteAddrs[addrStr]; dup {
+				err := fmt.Errorf("duplicate site address: %s", addrStr)
+				if (addrCopy.Host == Host && Host != DefaultHost) ||
+					(addrCopy.Port == Port && Port != DefaultPort) {
+					err = fmt.Errorf("site defined as %s is a duplicate of %s because of modified "+
+						"default host and/or port values (usually via -host or -port flags)", key, otherSiteKey)
+				}
+				return serverBlocks, err
+			}
+			siteAddrs[addrStr] = key
+
 			// If default HTTP or HTTPS ports have been customized,
 			// make sure the ACME challenge ports match
 			var altHTTPPort, altTLSSNIPort string
@@ -145,16 +167,21 @@ func (h *httpContext) InspectServerBlocks(sourceFile string, serverBlocks []cadd
 				altTLSSNIPort = HTTPSPort
 			}
 
+			// Make our caddytls.Config, which has a pointer to the
+			// instance's certificate cache and enough information
+			// to use automatic HTTPS when the time comes
+			caddytlsConfig := caddytls.NewConfig(h.instance)
+			caddytlsConfig.Hostname = addr.Host
+			caddytlsConfig.AltHTTPPort = altHTTPPort
+			caddytlsConfig.AltTLSSNIPort = altTLSSNIPort
+
 			// Save the config to our master list, and key it for lookups
 			cfg := &SiteConfig{
-				Addr: addr,
-				Root: Root,
-				TLS: &caddytls.Config{
-					Hostname:      addr.Host,
-					AltHTTPPort:   altHTTPPort,
-					AltTLSSNIPort: altTLSSNIPort,
-				},
+				Addr:            addr,
+				Root:            Root,
+				TLS:             caddytlsConfig,
 				originCaddyfile: sourceFile,
+				IndexPages:      staticfiles.DefaultIndexPages,
 			}
 			h.saveConfig(key, cfg)
 		}
@@ -234,7 +261,7 @@ func GetConfig(c *caddy.Controller) *SiteConfig {
 	// we should only get here during tests because directive
 	// actions typically skip the server blocks where we make
 	// the configs
-	cfg := &SiteConfig{Root: Root, TLS: new(caddytls.Config)}
+	cfg := &SiteConfig{Root: Root, TLS: new(caddytls.Config), IndexPages: staticfiles.DefaultIndexPages}
 	ctx.saveConfig(key, cfg)
 	return cfg
 }
