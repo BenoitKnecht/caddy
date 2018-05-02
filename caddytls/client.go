@@ -240,21 +240,28 @@ func (c *ACMEClient) Obtain(name string) error {
 	for attempts := 0; attempts < 2; attempts++ {
 		namesObtaining.Add([]string{name})
 		acmeMu.Lock()
-		certificate, failures := c.acmeClient.ObtainCertificate([]string{name}, true, nil, c.config.MustStaple)
+		certificate, err := c.acmeClient.ObtainCertificate([]string{name}, true, nil, c.config.MustStaple)
 		acmeMu.Unlock()
 		namesObtaining.Remove([]string{name})
-		if len(failures) > 0 {
-			// Error - try to fix it or report it to the user and abort
-
-			var errMsg string // combine all the failures into a single error message
-			for errDomain, obtainErr := range failures {
-				if obtainErr == nil {
-					continue
+		if err != nil {
+			// for a certain kind of error, we can enumerate the error per-domain
+			if failures, ok := err.(acme.ObtainError); ok && len(failures) > 0 {
+				var errMsg string // combine all the failures into a single error message
+				for errDomain, obtainErr := range failures {
+					if obtainErr == nil {
+						continue
+					}
+					errMsg += fmt.Sprintf("[%s] failed to get certificate: %v\n", errDomain, obtainErr)
 				}
-				errMsg += fmt.Sprintf("[%s] failed to get certificate: %v\n", errDomain, obtainErr)
+				return errors.New(errMsg)
 			}
 
-			return errors.New(errMsg)
+			return fmt.Errorf("[%s] failed to obtain certificate: %v", name, err)
+		}
+
+		// double-check that we actually got a certificate, in case there's a bug upstream (see issue #2121)
+		if certificate.Domain == "" || certificate.Certificate == nil {
+			return errors.New("returned certificate was empty; probably an unchecked error obtaining it")
 		}
 
 		// Success - immediately save the certificate resource
@@ -311,8 +318,15 @@ func (c *ACMEClient) Renew(name string) error {
 		acmeMu.Unlock()
 		namesObtaining.Remove([]string{name})
 		if err == nil {
-			success = true
-			break
+			// double-check that we actually got a certificate; check a couple fields
+			// TODO: This is a temporary workaround for what I think is a bug in the acmev2 package (March 2018)
+			// but it might not hurt to keep this extra check in place
+			if newCertMeta.Domain == "" || newCertMeta.Certificate == nil {
+				err = errors.New("returned certificate was empty; probably an unchecked error renewing it")
+			} else {
+				success = true
+				break
+			}
 		}
 
 		// wait a little bit and try again
