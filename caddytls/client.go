@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/mholt/caddy"
+	"github.com/mholt/caddy/telemetry"
 	"github.com/xenolf/lego/acmev2"
 )
 
@@ -244,10 +245,8 @@ func (c *ACMEClient) Obtain(name string) error {
 		acmeMu.Unlock()
 		namesObtaining.Remove([]string{name})
 		if err != nil {
-			// Error - try to fix it or report it to the user and abort
-
+			// for a certain kind of error, we can enumerate the error per-domain
 			if failures, ok := err.(acme.ObtainError); ok && len(failures) > 0 {
-				// in this case, we can enumerate the error per-domain
 				var errMsg string // combine all the failures into a single error message
 				for errDomain, obtainErr := range failures {
 					if obtainErr == nil {
@@ -261,9 +260,7 @@ func (c *ACMEClient) Obtain(name string) error {
 			return fmt.Errorf("[%s] failed to obtain certificate: %v", name, err)
 		}
 
-		// double-check that we actually got a certificate; check a couple fields
-		// TODO: This is a temporary workaround for what I think is a bug in the acmev2 package (March 2018)
-		// but it might not hurt to keep this extra check in place (April 18, 2018: might be fixed now.)
+		// double-check that we actually got a certificate, in case there's a bug upstream (see issue #2121)
 		if certificate.Domain == "" || certificate.Certificate == nil {
 			return errors.New("returned certificate was empty; probably an unchecked error obtaining it")
 		}
@@ -276,6 +273,8 @@ func (c *ACMEClient) Obtain(name string) error {
 
 		break
 	}
+
+	go telemetry.Increment("tls_acme_certs_obtained")
 
 	return nil
 }
@@ -344,6 +343,7 @@ func (c *ACMEClient) Renew(name string) error {
 	}
 
 	caddy.EmitEvent(caddy.CertRenewEvent, name)
+	go telemetry.Increment("tls_acme_certs_renewed")
 
 	return saveCertResource(c.storage, newCertMeta)
 }
@@ -369,6 +369,8 @@ func (c *ACMEClient) Revoke(name string) error {
 	if err != nil {
 		return err
 	}
+
+	go telemetry.Increment("tls_acme_certs_revoked")
 
 	err = c.storage.DeleteSite(name)
 	if err != nil {
@@ -420,4 +422,11 @@ func (c *nameCoordinator) Has(name string) bool {
 	_, ok := c.names[strings.ToLower(hostname)]
 	c.mu.RUnlock()
 	return ok
+}
+
+// KnownACMECAs is a list of ACME directory endpoints of
+// known, public, and trusted ACME-compatible certificate
+// authorities.
+var KnownACMECAs = []string{
+	"https://acme-v02.api.letsencrypt.org/directory",
 }
