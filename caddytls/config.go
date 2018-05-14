@@ -23,7 +23,7 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/codahale/aesnicheck"
+	"github.com/klauspost/cpuid"
 	"github.com/mholt/caddy"
 	"github.com/xenolf/lego/acmev2"
 )
@@ -432,7 +432,7 @@ func MakeTLSConfig(configs []*Config) (*tls.Config, error) {
 		// compatible), otherwise that is a configuration error
 		if otherConfig, ok := configMap[cfg.Hostname]; ok {
 			if err := assertConfigsCompatible(cfg, otherConfig); err != nil {
-				return nil, fmt.Errorf("incompabile TLS configurations for the same SNI "+
+				return nil, fmt.Errorf("incompatible TLS configurations for the same SNI "+
 					"name (%s) on the same listener: %v",
 					cfg.Hostname, err)
 			}
@@ -648,7 +648,7 @@ var defaultCiphersNonAESNI = []uint16{
 //
 // See https://github.com/mholt/caddy/issues/1674
 func getPreferredDefaultCiphers() []uint16 {
-	if aesnicheck.HasAESNI() {
+	if cpuid.CPU.AesNi() {
 		return defaultCiphers
 	}
 
