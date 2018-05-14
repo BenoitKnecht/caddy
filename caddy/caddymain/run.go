@@ -437,4 +437,4 @@ var (
 	gitFilesModified string // git diff-index --name-only HEAD
 )
 
-const enableTelemetry = true
+const enableTelemetry = false
