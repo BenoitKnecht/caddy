@@ -12,8 +12,6 @@ before_script:
 
 test:
   stage: test
-  tags:
-    - docker
   image: golang:1.9
   script:
     - echo 127.0.0.1 quic.clemente.io >> /etc/hosts
@@ -25,8 +23,6 @@ test:
 
 build:
   stage: build
-  tags:
-    - docker
   image: golang:1.9
   script:
     - cd caddy
