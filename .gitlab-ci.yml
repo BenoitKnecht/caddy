@@ -5,14 +5,9 @@ stages:
 variables:
   PKG: github.com/mholt/caddy
 
-before_script:
-  - mkdir -p /go/src/github.com/mholt
-  - ln -s $CI_PROJECT_DIR /go/src/$PKG
-  - cd /go/src/$PKG
-
 test:
   stage: test
-  image: golang:1.9
+  image: golang:1.12
   script:
     - echo 127.0.0.1 quic.clemente.io >> /etc/hosts
     - go get -t ./...
@@ -23,7 +18,7 @@ test:
 
 build:
   stage: build
-  image: golang:1.9
+  image: golang:1.12
   script:
     - cd caddy
     - go get ./...
