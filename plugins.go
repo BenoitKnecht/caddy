@@ -73,6 +73,13 @@ func DescribePlugins() string {
 		}
 	}
 
+	if len(pl["clustering"]) > 0 {
+		str += "\nClustering plugins:\n"
+		for _, name := range pl["clustering"] {
+			str += "  " + name + "\n"
+		}
+	}
+
 	str += "\nOther plugins:\n"
 	for _, name := range pl["others"] {
 		str += "  " + name + "\n"
@@ -263,9 +270,10 @@ type EventName string
 // Define names for the various events
 const (
 	StartupEvent         EventName = "startup"
-	ShutdownEvent        EventName = "shutdown"
-	CertRenewEvent       EventName = "certrenew"
-	InstanceStartupEvent EventName = "instancestartup"
+	ShutdownEvent                  = "shutdown"
+	CertRenewEvent                 = "certrenew"
+	InstanceStartupEvent           = "instancestartup"
+	InstanceRestartEvent           = "instancerestart"
 )
 
 // EventHook is a type which holds information about a startup hook plugin.

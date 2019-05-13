@@ -28,8 +28,10 @@ package proxy
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -48,6 +50,7 @@ var (
 	defaultDialer = &net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
+		DualStack: true,
 	}
 
 	bufferPool = sync.Pool{New: createBuffer}
@@ -67,7 +70,9 @@ func pooledIoCopy(dst io.Writer, src io.Reader) {
 	// Due to that we extend buf's length to its capacity here and
 	// ensure it's always non-zero.
 	bufCap := cap(buf)
-	io.CopyBuffer(dst, src, buf[0:bufCap:bufCap])
+	if _, err := io.CopyBuffer(dst, src, buf[0:bufCap:bufCap]); err != nil {
+		log.Println("[ERROR] failed to copy buffer: ", err)
+	}
 }
 
 // onExitFlushLoop is a callback set by tests to detect the state of the
@@ -130,12 +135,12 @@ func (rp *ReverseProxy) srvDialerFunc(locator string, timeout time.Duration) fun
 }
 
 func singleJoiningSlash(a, b string) string {
-	aslash := strings.HasSuffix(a, "/")
-	bslash := strings.HasPrefix(b, "/")
+	aSlash := strings.HasSuffix(a, "/")
+	bSlash := strings.HasPrefix(b, "/")
 	switch {
-	case aslash && bslash:
+	case aSlash && bSlash:
 		return a + b[1:]
-	case !aslash && !bslash && b != "":
+	case !aSlash && !bSlash && b != "":
 		return a + "/" + b
 	}
 	return a + b
@@ -147,7 +152,7 @@ func singleJoiningSlash(a, b string) string {
 // the target request will be for /base/dir.
 // Without logic: target's path is "/", incoming is "/api/messages",
 // without is "/api", then the target request will be for /messages.
-func NewSingleHostReverseProxy(target *url.URL, without string, keepalive int, timeout time.Duration) *ReverseProxy {
+func NewSingleHostReverseProxy(target *url.URL, without string, keepalive int, timeout, fallbackDelay time.Duration) *ReverseProxy {
 	targetQuery := target.RawQuery
 	director := func(req *http.Request) {
 		if target.Scheme == "unix" {
@@ -233,6 +238,9 @@ func NewSingleHostReverseProxy(target *url.URL, without string, keepalive int, t
 	if timeout != defaultDialer.Timeout {
 		dialer.Timeout = timeout
 	}
+	if fallbackDelay != defaultDialer.FallbackDelay {
+		dialer.FallbackDelay = fallbackDelay
+	}
 
 	rp := &ReverseProxy{
 		Director:      director,
@@ -270,7 +278,9 @@ func NewSingleHostReverseProxy(target *url.URL, without string, keepalive int, t
 			transport.MaxIdleConnsPerHost = keepalive
 		}
 		if httpserver.HTTP2 {
-			http2.ConfigureTransport(transport)
+			if err := http2.ConfigureTransport(transport); err != nil {
+				log.Println("[ERROR] failed to configure transport to use HTTP/2: ", err)
+			}
 		}
 		rp.Transport = transport
 	} else {
@@ -279,7 +289,9 @@ func NewSingleHostReverseProxy(target *url.URL, without string, keepalive int, t
 			Dial:  rp.dialer.Dial,
 		}
 		if httpserver.HTTP2 {
-			http2.ConfigureTransport(transport)
+			if err := http2.ConfigureTransport(transport); err != nil {
+				log.Println("[ERROR] failed to configure transport to use HTTP/2: ", err)
+			}
 		}
 		rp.Transport = transport
 	}
@@ -306,6 +318,25 @@ func (rp *ReverseProxy) UseInsecureTransport() {
 	}
 }
 
+// UseOwnCertificate is used to facilitate HTTPS proxying
+// with locally provided certificate.
+func (rp *ReverseProxy) UseOwnCACertificates(CaCertPool *x509.CertPool) {
+	if transport, ok := rp.Transport.(*http.Transport); ok {
+		if transport.TLSClientConfig == nil {
+			transport.TLSClientConfig = &tls.Config{}
+		}
+		transport.TLSClientConfig.RootCAs = CaCertPool
+		// No http2.ConfigureTransport() here.
+		// For now this is only added in places where
+		// an http.Transport is actually created.
+	} else if transport, ok := rp.Transport.(*h2quic.RoundTripper); ok {
+		if transport.TLSClientConfig == nil {
+			transport.TLSClientConfig = &tls.Config{}
+		}
+		transport.TLSClientConfig.RootCAs = CaCertPool
+	}
+}
+
 // ServeHTTP serves the proxied request to the upstream by performing a roundtrip.
 // It is designed to handle websocket connection upgrades as well.
 func (rp *ReverseProxy) ServeHTTP(rw http.ResponseWriter, outreq *http.Request, respUpdateFn respUpdateFn) error {
@@ -325,7 +356,7 @@ func (rp *ReverseProxy) ServeHTTP(rw http.ResponseWriter, outreq *http.Request, 
 		return err
 	}
 
-	isWebsocket := res.StatusCode == http.StatusSwitchingProtocols && strings.ToLower(res.Header.Get("Upgrade")) == "websocket"
+	isWebsocket := res.StatusCode == http.StatusSwitchingProtocols && strings.EqualFold(res.Header.Get("Upgrade"), "websocket")
 
 	// Remove hop-by-hop headers listed in the
 	// "Connection" header of the response.
@@ -370,7 +401,9 @@ func (rp *ReverseProxy) ServeHTTP(rw http.ResponseWriter, outreq *http.Request, 
 			if err != nil {
 				return err
 			}
-			outreq.Write(backendConn)
+			if err := outreq.Write(backendConn); err != nil {
+				log.Println("[ERROR] failed to write: ", err)
+			}
 		}
 		defer backendConn.Close()
 
@@ -392,7 +425,9 @@ func (rp *ReverseProxy) ServeHTTP(rw http.ResponseWriter, outreq *http.Request, 
 				if err != nil {
 					return err
 				}
-				backendConn.Write(rbuf)
+				if _, err := backendConn.Write(rbuf); err != nil {
+					log.Println("[ERROR] failed to write data to connection: ", err)
+				}
 			}
 		}
 		go func() {
@@ -410,7 +445,7 @@ func (rp *ReverseProxy) ServeHTTP(rw http.ResponseWriter, outreq *http.Request, 
 		bodyOpen := true
 		closeBody := func() {
 			if bodyOpen {
-				res.Body.Close()
+				_ = res.Body.Close()
 				bodyOpen = false
 			}
 		}
@@ -452,7 +487,7 @@ func (rp *ReverseProxy) ServeHTTP(rw http.ResponseWriter, outreq *http.Request, 
 		closeBody()
 
 		// Since Go does not remove keys from res.Trailer we
-		// can safely do a length comparison to check wether
+		// can safely do a length comparison to check whether
 		// we received further, unannounced trailers.
 		//
 		// Most of the time forceSetTrailers should be false.
@@ -657,7 +692,7 @@ func getTransportDialTLS(t *http.Transport) func(network, addr string) (net.Conn
 			errc <- err
 		}()
 		if err := <-errc; err != nil {
-			plainConn.Close()
+			_ = plainConn.Close()
 			return nil, err
 		}
 		if !tlsClientConfig.InsecureSkipVerify {
@@ -666,7 +701,7 @@ func getTransportDialTLS(t *http.Transport) func(network, addr string) (net.Conn
 				hostname = stripPort(addr)
 			}
 			if err := tlsConn.VerifyHostname(hostname); err != nil {
-				plainConn.Close()
+				_ = plainConn.Close()
 				return nil, err
 			}
 		}
@@ -698,7 +733,7 @@ func (tlsHandshakeTimeoutError) Temporary() bool { return true }
 func (tlsHandshakeTimeoutError) Error() string   { return "net/http: TLS handshake timeout" }
 
 func requestIsWebsocket(req *http.Request) bool {
-	return strings.ToLower(req.Header.Get("Upgrade")) == "websocket" && strings.Contains(strings.ToLower(req.Header.Get("Connection")), "upgrade")
+	return strings.EqualFold(req.Header.Get("Upgrade"), "websocket") && strings.Contains(strings.ToLower(req.Header.Get("Connection")), "upgrade")
 }
 
 type writeFlusher interface {

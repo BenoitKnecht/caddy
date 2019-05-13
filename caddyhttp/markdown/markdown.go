@@ -17,6 +17,7 @@
 package markdown
 
 import (
+	"log"
 	"net/http"
 	"os"
 	"path"
@@ -142,7 +143,7 @@ func (md Markdown) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error
 	case err == nil: // nop
 	case os.IsPermission(err):
 		return http.StatusForbidden, err
-	case os.IsExist(err):
+	case os.IsNotExist(err):
 		return http.StatusNotFound, nil
 	default: // did we run out of FD?
 		return http.StatusInternalServerError, err
@@ -168,7 +169,9 @@ func (md Markdown) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error
 	w.Header().Set("Content-Length", strconv.Itoa(len(html)))
 	httpserver.SetLastModifiedHeader(w, lastModTime)
 	if r.Method == http.MethodGet {
-		w.Write(html)
+		if _, err := w.Write(html); err != nil {
+			log.Println("[ERROR] failed to write html response: ", err)
+		}
 	}
 	return http.StatusOK, nil
 }

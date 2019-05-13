@@ -2,39 +2,23 @@ stages:
   - test
   - build
 
-variables:
-  PKG: github.com/mholt/caddy
-
-before_script:
-  - mkdir -p /go/src/github.com/mholt
-  - ln -s $CI_PROJECT_DIR /go/src/$PKG
-  - cd /go/src/$PKG
-
 test:
   stage: test
-  tags:
-    - docker
-  image: golang:1.9
+  image: golang:1.12
   script:
     - echo 127.0.0.1 quic.clemente.io >> /etc/hosts
     - go get -t ./...
-    - go get github.com/alecthomas/gometalinter
-    - gometalinter --install
-    - gometalinter --disable-all -E vet -E gofmt -E misspell -E ineffassign -E goimports -E deadcode --tests --vendor ./...
+    - go get github.com/golangci/golangci-lint/cmd/golangci-lint
+    - golangci-lint run -E gofmt -E misspell -E goimports -D deadcode -D errcheck -D staticcheck -D gosimple -D unused --tests
     - go test -race ./...
 
 build:
   stage: build
-  tags:
-    - docker
-  image: golang:1.9
+  image: golang:1.12
   script:
-    - cd caddy
     - go get ./...
-    - go get github.com/caddyserver/builds
-    - go run build.go
-    - mkdir ../$CI_PROJECT_NAME-${CI_COMMIT_TAG:-$CI_COMMIT_REF_NAME}
-    - mv caddy ../$CI_PROJECT_NAME-${CI_COMMIT_TAG:-$CI_COMMIT_REF_NAME}
+    - mkdir $CI_PROJECT_NAME-${CI_COMMIT_TAG:-$CI_COMMIT_REF_NAME}
+    - mv caddy $CI_PROJECT_NAME-${CI_COMMIT_TAG:-$CI_COMMIT_REF_NAME}
   artifacts:
     untracked: true
     name: $CI_PROJECT_NAME-${CI_COMMIT_TAG:-$CI_COMMIT_REF_NAME}
