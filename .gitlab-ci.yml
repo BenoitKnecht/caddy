@@ -8,9 +8,8 @@ test:
   script:
     - echo 127.0.0.1 quic.clemente.io >> /etc/hosts
     - go get -t ./...
-    - go get github.com/alecthomas/gometalinter
-    - gometalinter --install
-    - gometalinter --disable-all -E vet -E gofmt -E misspell -E ineffassign -E goimports -E deadcode --tests --vendor ./...
+    - go get github.com/golangci/golangci-lint/cmd/golangci-lint
+    - golangci-lint run -E gofmt -E misspell -E goimports -D deadcode -D errcheck -D staticcheck -D gosimple -D unused --tests
     - go test -race ./...
 
 build:
