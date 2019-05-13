@@ -19,21 +19,24 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 
 	"github.com/google/uuid"
 	"github.com/klauspost/cpuid"
 	"github.com/mholt/caddy"
+	"github.com/mholt/caddy/caddyfile"
 	"github.com/mholt/caddy/caddytls"
 	"github.com/mholt/caddy/telemetry"
-	"github.com/xenolf/lego/acmev2"
-	"gopkg.in/natefinch/lumberjack.v2"
+	"github.com/mholt/certmagic"
+	lumberjack "gopkg.in/natefinch/lumberjack.v2"
 
 	_ "github.com/mholt/caddy/caddyhttp" // plug in the HTTP server type
 	// This is where other plugins get plugged in (imported)
@@ -44,23 +47,29 @@ import (
 
 func init() {
 	caddy.TrapSignals()
-	setVersion()
 
-	flag.BoolVar(&caddytls.Agreed, "agree", false, "Agree to the CA's Subscriber Agreement")
-	flag.StringVar(&caddytls.DefaultCAUrl, "ca", "https://acme-v02.api.letsencrypt.org/directory", "URL to certificate authority's ACME server directory")
-	flag.BoolVar(&caddytls.DisableHTTPChallenge, "disable-http-challenge", caddytls.DisableHTTPChallenge, "Disable the ACME HTTP challenge")
-	flag.BoolVar(&caddytls.DisableTLSSNIChallenge, "disable-tls-sni-challenge", caddytls.DisableTLSSNIChallenge, "Disable the ACME TLS-SNI challenge")
+	flag.BoolVar(&certmagic.Default.Agreed, "agree", false, "Agree to the CA's Subscriber Agreement")
+	flag.StringVar(&certmagic.Default.CA, "ca", certmagic.Default.CA, "URL to certificate authority's ACME server directory")
+	flag.StringVar(&certmagic.Default.DefaultServerName, "default-sni", certmagic.Default.DefaultServerName, "If a ClientHello ServerName is empty, use this ServerName to choose a TLS certificate")
+	flag.BoolVar(&certmagic.Default.DisableHTTPChallenge, "disable-http-challenge", certmagic.Default.DisableHTTPChallenge, "Disable the ACME HTTP challenge")
+	flag.BoolVar(&certmagic.Default.DisableTLSALPNChallenge, "disable-tls-alpn-challenge", certmagic.Default.DisableTLSALPNChallenge, "Disable the ACME TLS-ALPN challenge")
 	flag.StringVar(&disabledMetrics, "disabled-metrics", "", "Comma-separated list of telemetry metrics to disable")
 	flag.StringVar(&conf, "conf", "", "Caddyfile to load (default \""+caddy.DefaultConfigFile+"\")")
 	flag.StringVar(&cpu, "cpu", "100%", "CPU cap")
+	flag.BoolVar(&printEnv, "env", false, "Enable to print environment variables")
+	flag.StringVar(&envFile, "envfile", "", "Path to file with environment variables to load in KEY=VALUE format")
+	flag.BoolVar(&fromJSON, "json-to-caddyfile", false, "From JSON stdin to Caddyfile stdout")
 	flag.BoolVar(&plugins, "plugins", false, "List installed plugins")
-	flag.StringVar(&caddytls.DefaultEmail, "email", "", "Default ACME CA account email address")
-	flag.DurationVar(&acme.HTTPClient.Timeout, "catimeout", acme.HTTPClient.Timeout, "Default ACME CA HTTP timeout")
+	flag.StringVar(&certmagic.Default.Email, "email", "", "Default ACME CA account email address")
+	flag.DurationVar(&certmagic.HTTPTimeout, "catimeout", certmagic.HTTPTimeout, "Default ACME CA HTTP timeout")
 	flag.StringVar(&logfile, "log", "", "Process log file")
+	flag.IntVar(&logRollMB, "log-roll-mb", 100, "Roll process log when it reaches this many megabytes (0 to disable rolling)")
+	flag.BoolVar(&logRollCompress, "log-roll-compress", true, "Gzip-compress rolled process log files")
 	flag.StringVar(&caddy.PidFile, "pidfile", "", "Path to write pid file")
 	flag.BoolVar(&caddy.Quiet, "quiet", false, "Quiet mode (no initialization output)")
 	flag.StringVar(&revoke, "revoke", "", "Hostname for which to revoke the certificate")
 	flag.StringVar(&serverType, "type", "http", "Type of server to run")
+	flag.BoolVar(&toJSON, "caddyfile-to-json", false, "From Caddyfile stdin to JSON stdout")
 	flag.BoolVar(&version, "version", false, "Show version")
 	flag.BoolVar(&validate, "validate", false, "Parse the Caddyfile but do not start the server")
 
@@ -72,9 +81,12 @@ func init() {
 func Run() {
 	flag.Parse()
 
+	module := getBuildModule()
+	cleanModVersion := strings.TrimPrefix(module.Version, "v")
+
 	caddy.AppName = appName
-	caddy.AppVersion = appVersion
-	acme.UserAgent = appName + "/" + appVersion
+	caddy.AppVersion = module.Version
+	certmagic.UserAgent = appName + "/" + cleanModVersion
 
 	// Set up process log before anything bad happens
 	switch logfile {
@@ -85,16 +97,41 @@ func Run() {
 	case "":
 		log.SetOutput(ioutil.Discard)
 	default:
-		log.SetOutput(&lumberjack.Logger{
-			Filename:   logfile,
-			MaxSize:    100,
-			MaxAge:     14,
-			MaxBackups: 10,
-		})
+		if logRollMB > 0 {
+			log.SetOutput(&lumberjack.Logger{
+				Filename:   logfile,
+				MaxSize:    logRollMB,
+				MaxAge:     14,
+				MaxBackups: 10,
+				Compress:   logRollCompress,
+			})
+		} else {
+			err := os.MkdirAll(filepath.Dir(logfile), 0755)
+			if err != nil {
+				mustLogFatalf("%v", err)
+			}
+			f, err := os.OpenFile(logfile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+			if err != nil {
+				mustLogFatalf("%v", err)
+			}
+			// don't close file; log should be writeable for duration of process
+			log.SetOutput(f)
+		}
+	}
+
+	// load all additional envs as soon as possible
+	if err := LoadEnvFromFile(envFile); err != nil {
+		mustLogFatalf("%v", err)
+	}
+
+	if printEnv {
+		for _, v := range os.Environ() {
+			fmt.Println(v)
+		}
 	}
 
 	// initialize telemetry client
-	if enableTelemetry {
+	if EnableTelemetry {
 		err := initTelemetry()
 		if err != nil {
 			mustLogFatalf("[ERROR] Initializing telemetry: %v", err)
@@ -113,9 +150,11 @@ func Run() {
 		os.Exit(0)
 	}
 	if version {
-		fmt.Printf("%s %s (unofficial)\n", appName, appVersion)
-		if devBuild && gitShortStat != "" {
-			fmt.Printf("%s\n%s\n", gitShortStat, gitFilesModified)
+		if module.Sum != "" {
+			// a build with a known version will also have a checksum
+			fmt.Printf("Caddy %s (%s)\n", module.Version, module.Sum)
+		} else {
+			fmt.Println(module.Version)
 		}
 		os.Exit(0)
 	}
@@ -123,6 +162,9 @@ func Run() {
 		fmt.Println(caddy.DescribePlugins())
 		os.Exit(0)
 	}
+
+	// Check if we just need to do a Caddyfile Convert and exit
+	checkJSONCaddyfile()
 
 	// Set CPU cap
 	err := setCPU(cpu)
@@ -156,11 +198,8 @@ func Run() {
 		mustLogFatalf("%v", err)
 	}
 
-	// Execute instantiation events
-	caddy.EmitEvent(caddy.InstanceStartupEvent, instance)
-
 	// Begin telemetry (these are no-ops if telemetry disabled)
-	telemetry.Set("caddy_version", appVersion)
+	telemetry.Set("caddy_version", module.Version)
 	telemetry.Set("num_listeners", len(instance.Servers()))
 	telemetry.Set("server_type", serverType)
 	telemetry.Set("os", runtime.GOOS)
@@ -241,24 +280,55 @@ func defaultLoader(serverType string) (caddy.Input, error) {
 	}, nil
 }
 
-// setVersion figures out the version information
-// based on variables set by -ldflags.
-func setVersion() {
-	// A development build is one that's not at a tag or has uncommitted changes
-	devBuild = gitTag == "" || gitShortStat != ""
-
-	if buildDate != "" {
-		buildDate = " " + buildDate
-	}
-
-	// Only set the appVersion if -ldflags was used
-	if gitNearestTag != "" || gitTag != "" {
-		if devBuild && gitNearestTag != "" {
-			appVersion = fmt.Sprintf("%s (+%s%s)",
-				strings.TrimPrefix(gitNearestTag, "v"), gitCommit, buildDate)
-		} else if gitTag != "" {
-			appVersion = strings.TrimPrefix(gitTag, "v")
+// getBuildModule returns the build info of Caddy
+// from debug.BuildInfo (requires Go modules). If
+// no version information is available, a non-nil
+// value will still be returned, but with an
+// unknown version.
+func getBuildModule() *debug.Module {
+	bi, ok := debug.ReadBuildInfo()
+	if ok {
+		// The recommended way to build Caddy involves
+		// creating a separate main module, which
+		// preserves caddy a read-only dependency
+		// TODO: track related Go issue: https://github.com/golang/go/issues/29228
+		for _, mod := range bi.Deps {
+			if mod.Path == "github.com/mholt/caddy" {
+				return mod
+			}
 		}
+	}
+	return &debug.Module{Version: "unknown"}
+}
+
+func checkJSONCaddyfile() {
+	if fromJSON {
+		jsonBytes, err := ioutil.ReadAll(os.Stdin)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Read stdin failed: %v", err)
+			os.Exit(1)
+		}
+		caddyfileBytes, err := caddyfile.FromJSON(jsonBytes)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Converting from JSON failed: %v", err)
+			os.Exit(2)
+		}
+		fmt.Println(string(caddyfileBytes))
+		os.Exit(0)
+	}
+	if toJSON {
+		caddyfileBytes, err := ioutil.ReadAll(os.Stdin)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Read stdin failed: %v", err)
+			os.Exit(1)
+		}
+		jsonBytes, err := caddyfile.ToJSON(caddyfileBytes)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Converting to JSON failed: %v", err)
+			os.Exit(2)
+		}
+		fmt.Println(string(jsonBytes))
+		os.Exit(0)
 	}
 }
 
@@ -345,10 +415,18 @@ func detectContainer() bool {
 // initTelemetry initializes the telemetry engine.
 func initTelemetry() error {
 	uuidFilename := filepath.Join(caddy.AssetsPath(), "uuid")
+	if customUUIDFile := os.Getenv("CADDY_UUID_FILE"); customUUIDFile != "" {
+		uuidFilename = customUUIDFile
+	}
 
 	newUUID := func() uuid.UUID {
 		id := uuid.New()
-		err := ioutil.WriteFile(uuidFilename, []byte(id.String()), 0600) // human-readable as a string
+		err := os.MkdirAll(caddy.AssetsPath(), 0700)
+		if err != nil {
+			log.Printf("[ERROR] Persisting instance UUID: %v", err)
+			return id
+		}
+		err = ioutil.WriteFile(uuidFilename, []byte(id.String()), 0600) // human-readable as a string
 		if err != nil {
 			log.Printf("[ERROR] Persisting instance UUID: %v", err)
 		}
@@ -386,13 +464,10 @@ func initTelemetry() error {
 			// mitigate disk space exhaustion at the collection endpoint
 			return fmt.Errorf("too many metrics to disable")
 		}
-		disabledMetricsSlice = strings.Split(disabledMetrics, ",")
-		for i, metric := range disabledMetricsSlice {
+		disabledMetricsSlice = splitTrim(disabledMetrics, ",")
+		for _, metric := range disabledMetricsSlice {
 			if metric == "instance_id" || metric == "timestamp" || metric == "disabled_metrics" {
 				return fmt.Errorf("instance_id, timestamp, and disabled_metrics cannot be disabled")
-			}
-			if metric == "" {
-				disabledMetricsSlice = append(disabledMetricsSlice[:i], disabledMetricsSlice[i+1:]...)
 			}
 		}
 	}
@@ -409,6 +484,101 @@ func initTelemetry() error {
 	return nil
 }
 
+// Split string s into all substrings separated by sep and returns a slice of
+// the substrings between those separators.
+//
+// If s does not contain sep and sep is not empty, Split returns a
+// slice of length 1 whose only element is s.
+//
+// If sep is empty, Split splits after each UTF-8 sequence. If both s
+// and sep are empty, Split returns an empty slice.
+//
+// Each item that in result is trim space and not empty string
+func splitTrim(s string, sep string) []string {
+	splitItems := strings.Split(s, sep)
+	trimItems := make([]string, 0, len(splitItems))
+	for _, item := range splitItems {
+		if item = strings.TrimSpace(item); item != "" {
+			trimItems = append(trimItems, item)
+		}
+	}
+	return trimItems
+}
+
+// LoadEnvFromFile loads additional envs if file provided and exists
+// Envs in file should be in KEY=VALUE format
+func LoadEnvFromFile(envFile string) error {
+	if envFile == "" {
+		return nil
+	}
+
+	file, err := os.Open(envFile)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	envMap, err := ParseEnvFile(file)
+	if err != nil {
+		return err
+	}
+
+	for k, v := range envMap {
+		if err := os.Setenv(k, v); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// ParseEnvFile implements parse logic for environment files
+func ParseEnvFile(envInput io.Reader) (map[string]string, error) {
+	envMap := make(map[string]string)
+
+	scanner := bufio.NewScanner(envInput)
+	var line string
+	lineNumber := 0
+
+	for scanner.Scan() {
+		line = strings.TrimSpace(scanner.Text())
+		lineNumber++
+
+		// skip lines starting with comment
+		if strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// skip empty line
+		if len(line) == 0 {
+			continue
+		}
+
+		fields := strings.SplitN(line, "=", 2)
+		if len(fields) != 2 {
+			return nil, fmt.Errorf("Can't parse line %d; line should be in KEY=VALUE format", lineNumber)
+		}
+
+		if strings.Contains(fields[0], " ") {
+			return nil, fmt.Errorf("Can't parse line %d; KEY contains whitespace", lineNumber)
+		}
+
+		key := fields[0]
+		val := fields[1]
+
+		if key == "" {
+			return nil, fmt.Errorf("Can't parse line %d; KEY can't be empty string", lineNumber)
+		}
+		envMap[key] = val
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
+	return envMap, nil
+}
+
 const appName = "Caddy"
 
 // Flags that control program flow or startup
@@ -416,25 +586,19 @@ var (
 	serverType      string
 	conf            string
 	cpu             string
+	envFile         string
+	fromJSON        bool
 	logfile         string
+	logRollMB       int
+	logRollCompress bool
 	revoke          string
+	toJSON          bool
 	version         bool
 	plugins         bool
+	printEnv        bool
 	validate        bool
 	disabledMetrics string
 )
 
-// Build information obtained with the help of -ldflags
-var (
-	appVersion = "(untracked dev build)" // inferred at startup
-	devBuild   = true                    // inferred at startup
-
-	buildDate        string // date -u
-	gitTag           string // git describe --exact-match HEAD 2> /dev/null
-	gitNearestTag    string // git describe --abbrev=0 --tags HEAD
-	gitCommit        string // git rev-parse HEAD
-	gitShortStat     string // git diff-index --shortstat
-	gitFilesModified string // git diff-index --name-only HEAD
-)
-
-const enableTelemetry = false
+// EnableTelemetry defines whether telemetry is enabled in Run.
+var EnableTelemetry = false

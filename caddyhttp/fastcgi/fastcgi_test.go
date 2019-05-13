@@ -16,11 +16,13 @@ package fastcgi
 
 import (
 	"context"
+	"log"
 	"net"
 	"net/http"
 	"net/http/fcgi"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"testing"
@@ -38,11 +40,20 @@ func TestServeHTTP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unable to create listener for test: %v", err)
 	}
-	defer listener.Close()
-	go fcgi.Serve(listener, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Length", bodyLenStr)
-		w.Write([]byte(body))
-	}))
+	defer func() { _ = listener.Close() }()
+
+	go func() {
+		err := fcgi.Serve(listener, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Length", bodyLenStr)
+			_, err := w.Write([]byte(body))
+			if err != nil {
+				log.Printf("[ERROR] unable to write header: %v", err)
+			}
+		}))
+		if err != nil {
+			log.Printf("[ERROR] unable to start server: %v", err)
+		}
+	}()
 
 	handler := Handler{
 		Next:  nil,
@@ -146,7 +157,7 @@ func TestBuildEnv(t *testing.T) {
 		SplitPath:  ".php",
 		IndexFiles: []string{"index.php"},
 	}
-	url, err := url.Parse("http://localhost:2015/fgci_test.php?test=foobar")
+	u, err := url.Parse("http://localhost:2015/fgci_test.php?test=foobar")
 	if err != nil {
 		t.Error("Unexpected error:", err.Error())
 	}
@@ -154,7 +165,7 @@ func TestBuildEnv(t *testing.T) {
 	var newReq = func() *http.Request {
 		r := http.Request{
 			Method:     "GET",
-			URL:        url,
+			URL:        u,
 			Proto:      "HTTP/1.1",
 			ProtoMajor: 1,
 			ProtoMinor: 1,
@@ -238,6 +249,21 @@ func TestBuildEnv(t *testing.T) {
 	envExpected = newEnv()
 	envExpected["SCRIPT_NAME"] = "/test/fgci_test.php"
 	testBuildEnv(r, rule, fpath, envExpected)
+
+	// 7. Test SCRIPT_NAME,SCRIPT_FILENAME do not include PATH_INFO
+	fpath = "/fgci_test.php/extra/paths"
+	r = newReq()
+	envExpected = newEnv()
+	envExpected["PATH_INFO"] = "/extra/paths"
+	envExpected["SCRIPT_NAME"] = "/fgci_test.php"
+	envExpected["SCRIPT_FILENAME"] = filepath.FromSlash("/fgci_test.php")
+	testBuildEnv(r, rule, fpath, envExpected)
+
+	// 8. Test REQUEST_SCHEME in env
+	r = newReq()
+	envExpected = newEnv()
+	envExpected["REQUEST_SCHEME"] = "http"
+	testBuildEnv(r, rule, fpath, envExpected)
 }
 
 func TestReadTimeout(t *testing.T) {
@@ -258,7 +284,7 @@ func TestReadTimeout(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Test %d: Unable to create listener for test: %v", i, err)
 		}
-		defer listener.Close()
+		defer func() { _ = listener.Close() }()
 
 		handler := Handler{
 			Next: nil,
@@ -277,11 +303,16 @@ func TestReadTimeout(t *testing.T) {
 		w := httptest.NewRecorder()
 
 		wg.Add(1)
-		go fcgi.Serve(listener, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			time.Sleep(test.sleep)
-			w.WriteHeader(http.StatusOK)
-			wg.Done()
-		}))
+		go func() {
+			err := fcgi.Serve(listener, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				time.Sleep(test.sleep)
+				w.WriteHeader(http.StatusOK)
+				wg.Done()
+			}))
+			if err != nil {
+				log.Printf("[ERROR] unable to start server: %v", err)
+			}
+		}()
 
 		got, err := handler.ServeHTTP(w, r)
 		if test.shouldErr {
@@ -318,7 +349,7 @@ func TestSendTimeout(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Test %d: Unable to create listener for test: %v", i, err)
 		}
-		defer listener.Close()
+		defer func() { _ = listener.Close() }()
 
 		handler := Handler{
 			Next: nil,
@@ -336,9 +367,14 @@ func TestSendTimeout(t *testing.T) {
 		}
 		w := httptest.NewRecorder()
 
-		go fcgi.Serve(listener, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusOK)
-		}))
+		go func() {
+			err := fcgi.Serve(listener, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			}))
+			if err != nil {
+				log.Printf("[ERROR] unable to start server: %v", err)
+			}
+		}()
 
 		got, err := handler.ServeHTTP(w, r)
 		if test.shouldErr {
