@@ -4,8 +4,10 @@ COPY . /go/src/github.com/mholt/caddy/
 
 WORKDIR /go/src/github.com/mholt/caddy
 
+ENV GO111MODULE=on 
+
 RUN go get ./...
-RUN CGO_ENABLED=0 GO111MODULE=on go build
+RUN CGO_ENABLED=0 go build
 
 FROM alpine:3.9
 
