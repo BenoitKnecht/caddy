@@ -3,7 +3,7 @@ FROM golang:1.12 as build
 COPY  . /go/src/github.com/BenoitKnecht/caddy
 WORKDIR /go/src/github.com/BenoitKnecht/caddy
 
-ENV GO111MODULE=on 
+ENV GO111MODULE=on
 
 RUN CGO_ENABLED=0 go build
 
